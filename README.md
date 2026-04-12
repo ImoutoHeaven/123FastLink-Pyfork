@@ -49,7 +49,7 @@ python -m fastlink_transfer export-json \
 
 某些成功后清理失败的恢复场景下，还可能短暂残留 `<state-file>.output.committed`；这是内部成功标记，不是用户导出文件。
 
-中断后可复用同一个 `--state-file` 续跑；成功完成后，最终只保留 `--output-file`。如果清理内部文件时失败，命令仍返回 `0`，但会打印 cleanup warning。
+中断后可复用同一个 `--state-file` 续跑；`export-json` 不需要 `--retry-failed`。成功完成后，最终只保留 `--output-file`。如果清理内部文件时失败，命令仍返回 `0`，但会打印 cleanup warning。
 
 ## import-json Dry Run
 
