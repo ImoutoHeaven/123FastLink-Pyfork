@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastlink-transfer"
+version = "0.1.0"
+description = "123Pan JSON rapid-transfer CLI"
+requires-python = ">=3.11"
+dependencies = [
+  "curl_cffi>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

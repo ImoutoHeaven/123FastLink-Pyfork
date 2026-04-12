@@ -1,0 +1,18 @@
+{
+  "scriptVersion": "3.1.4",
+  "exportVersion": "1.0",
+  "usesBase62EtagsInExport": false,
+  "commonPath": "Demo/",
+  "files": [
+    {
+      "etag": "0123456789abcdef0123456789abcdef",
+      "size": "10",
+      "path": "1983/06/example-a.rar"
+    },
+    {
+      "etag": "fedcba9876543210fedcba9876543210",
+      "size": "11",
+      "path": "1983/07/example-b.rar"
+    }
+  ]
+}
