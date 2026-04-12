@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastlink_transfer.api import PanApiClient
 from fastlink_transfer.auth import build_session, load_credentials
 from fastlink_transfer.cli import parse_args
+from fastlink_transfer.exporter import run_export_json
 from fastlink_transfer.importer import collect_folder_keys, load_export_file, select_pending_records
 from fastlink_transfer.runner import create_remote_directories, run_file_phase, safe_print
 from fastlink_transfer.state import load_or_initialize_state
@@ -38,6 +39,11 @@ def run_cli(argv=None) -> int:
     _, config = parse_args(argv)
     creds = load_credentials()
     session = build_session(creds)
+
+    if config.command == "export_json":
+        api_client = PanApiClient(host=creds.host, session=session)
+        return run_export_json(api_client=api_client, config=config)
+
     export_data = load_export_file(config.file_path)
     state = load_or_initialize_state(
         state_path=config.state_file,

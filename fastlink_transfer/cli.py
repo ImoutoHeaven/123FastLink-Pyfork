@@ -19,6 +19,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_json.add_argument("--flush-every", type=int, default=100)
     import_json.add_argument("--retry-failed", action="store_true")
     import_json.add_argument("--dry-run", action="store_true")
+
+    export_json = subparsers.add_parser("export-json")
+    export_json.set_defaults(command="export_json")
+    export_json.add_argument("--source-parent-id", required=True)
+    export_json.add_argument("--output-file", required=True)
+    export_json.add_argument("--state-file", required=True)
+    export_json.add_argument("--workers", type=int, default=8)
+    export_json.add_argument("--max-retries", type=int, default=5)
+    export_json.add_argument("--flush-every", type=int, default=100)
+
     return parser
 
 

@@ -6,6 +6,7 @@ import pytest
 
 from fastlink_transfer.api import Decision, DecisionKind
 from fastlink_transfer.app import run_cli, summarize_exit_code
+from fastlink_transfer.config import ExportJsonConfig, build_command_config
 from fastlink_transfer.importer import load_export_file
 
 
@@ -41,6 +42,7 @@ def _patch_non_dry_run_dependencies(
     run_file_phase_impl=None,
 ):
     config = SimpleNamespace(
+        command="import_json",
         file_path=tmp_path / "export.json",
         target_parent_id="12345678",
         state_file=tmp_path / "state.json",
@@ -98,6 +100,119 @@ def test_summarize_exit_code_returns_nonzero_for_failed_items():
 
 def test_summarize_exit_code_returns_nonzero_for_credential_fatal():
     assert summarize_exit_code(failed_count=0, credential_fatal=True) == 1
+
+
+def test_build_command_config_builds_export_json_config(tmp_path):
+    args = SimpleNamespace(
+        command="export_json",
+        source_parent_id="12345678",
+        output_file=str(tmp_path / "out.json"),
+        state_file=str(tmp_path / "state.json"),
+        workers=16,
+        max_retries=7,
+        flush_every=50,
+    )
+
+    config = build_command_config(args)
+
+    assert isinstance(config, ExportJsonConfig)
+    assert config.command == "export_json"
+    assert config.source_parent_id == "12345678"
+    assert config.output_file == (tmp_path / "out.json").resolve()
+    assert config.state_file == (tmp_path / "state.json").resolve()
+    assert config.workers == 16
+    assert config.max_retries == 7
+    assert config.flush_every == 50
+
+
+def test_run_cli_routes_export_json_to_export_runner(monkeypatch, tmp_path):
+    config = ExportJsonConfig(
+        command="export_json",
+        source_parent_id="12345678",
+        output_file=(tmp_path / "out.json").resolve(),
+        state_file=(tmp_path / "state.json").resolve(),
+        workers=8,
+        max_retries=5,
+        flush_every=100,
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        "fastlink_transfer.app.parse_args",
+        lambda argv=None: (SimpleNamespace(command="export_json"), config),
+    )
+    monkeypatch.setattr(
+        "fastlink_transfer.app.load_credentials",
+        lambda: SimpleNamespace(host="https://www.123pan.com"),
+    )
+    monkeypatch.setattr("fastlink_transfer.app.build_session", lambda creds: object())
+    monkeypatch.setattr(
+        "fastlink_transfer.app.run_export_json",
+        lambda **kwargs: calls.append(kwargs) or 0,
+    )
+
+    exit_code = run_cli(["export-json"])
+
+    assert exit_code == 0
+    assert calls and calls[0]["config"] == config
+
+
+def test_run_cli_export_json_happy_path_leaves_final_json(monkeypatch, tmp_path):
+    config = ExportJsonConfig(
+        command="export_json",
+        source_parent_id="12345678",
+        output_file=(tmp_path / "out.json").resolve(),
+        state_file=(tmp_path / "export.state.json").resolve(),
+        workers=1,
+        max_retries=0,
+        flush_every=1,
+    )
+
+    class HappyClient:
+        def __init__(self, host, session):
+            self.host = host
+
+        def get_directory_identity(self, *, parent_file_id):
+            return Decision(kind=DecisionKind.DIRECTORY_CREATED, payload={"root_name": "Movies"})
+
+        def get_file_list(self, *, parent_file_id):
+            return Decision(
+                kind=DecisionKind.COMPLETED,
+                payload={
+                    "items": [
+                        {
+                            "FileId": 1,
+                            "Type": 0,
+                            "FileName": "a.txt",
+                            "Etag": "0" * 32,
+                            "Size": 5,
+                        }
+                    ],
+                    "total": 1,
+                },
+            )
+
+    monkeypatch.setattr(
+        "fastlink_transfer.app.parse_args",
+        lambda argv=None: (SimpleNamespace(command="export_json"), config),
+    )
+    monkeypatch.setattr(
+        "fastlink_transfer.app.load_credentials",
+        lambda: SimpleNamespace(host="https://www.123pan.com"),
+    )
+    monkeypatch.setattr("fastlink_transfer.app.build_session", lambda creds: object())
+    monkeypatch.setattr("fastlink_transfer.app.PanApiClient", HappyClient)
+
+    assert run_cli(["export-json"]) == 0
+
+    payload = json.loads(config.output_file.read_text(encoding="utf-8"))
+    assert payload["commonPath"] == "Movies/"
+    assert payload["totalFilesCount"] == 1
+    assert payload["files"] == [{"path": "a.txt", "etag": "0", "size": "5"}]
+    assert not config.state_file.exists()
+    assert not config.state_file.with_suffix(".records.jsonl").exists()
+    assert not config.state_file.with_suffix(".finalize.sqlite3").exists()
+    assert not config.state_file.with_suffix(".output.tmp.json").exists()
 
 
 def test_run_cli_dry_run_skips_remote_mutation(monkeypatch, tmp_path, capsys):

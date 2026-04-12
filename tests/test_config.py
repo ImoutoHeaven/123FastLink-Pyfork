@@ -60,3 +60,29 @@ def test_build_command_config_rejects_invalid_values(
     )
     with pytest.raises(ValueError):
         build_command_config(args)
+
+
+@pytest.mark.parametrize(
+    ("state_name", "output_name"),
+    [
+        ("export.state.json", "export.state.json"),
+        ("export.state.json", "export.state.records.jsonl"),
+        ("export.state.json", "export.state.finalize.sqlite3"),
+        ("export.state.json", "export.state.output.tmp.json"),
+    ],
+)
+def test_build_command_config_rejects_export_output_colliding_with_internal_artifacts(
+    tmp_path, state_name, output_name
+):
+    args = Namespace(
+        source_parent_id="12345678",
+        output_file=str(tmp_path / output_name),
+        state_file=str(tmp_path / state_name),
+        workers=8,
+        max_retries=5,
+        flush_every=100,
+        command="export_json",
+    )
+
+    with pytest.raises(ValueError, match="output_file must be distinct from internal export artifacts"):
+        build_command_config(args)

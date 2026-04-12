@@ -1,3 +1,5 @@
+import argparse
+
 from fastlink_transfer.cli import build_parser
 
 
@@ -51,3 +53,35 @@ def test_parser_accepts_runtime_flags():
     assert args.flush_every == 50
     assert args.retry_failed is True
     assert args.dry_run is True
+
+
+def test_build_parser_supports_export_json_command():
+    parser = build_parser()
+    subparsers = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+
+    assert "export-json" in subparsers.choices
+
+    args = parser.parse_args(
+        [
+            "export-json",
+            "--source-parent-id",
+            "12345678",
+            "--output-file",
+            "out.json",
+            "--state-file",
+            "state.json",
+        ]
+    )
+
+    assert args.command == "export_json"
+    assert args.source_parent_id == "12345678"
+    assert args.output_file == "out.json"
+    assert args.state_file == "state.json"
+    assert args.workers == 8
+    assert args.max_retries == 5
+    assert args.flush_every == 100
+    assert not hasattr(args, "dry_run")
