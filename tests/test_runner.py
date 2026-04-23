@@ -1,5 +1,6 @@
 import json
 import queue
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -7,13 +8,16 @@ from pathlib import Path
 import pytest
 
 from fastlink_transfer.api import Decision, DecisionKind, PanApiClient
+from fastlink_transfer.import_state import open_or_initialize_import_state
 from fastlink_transfer.importer import SourceRecord, load_export_file, select_pending_records
 from fastlink_transfer.runner import (
     GlobalPause,
     StopController,
     create_remote_directories,
+    finalize_import_job,
     process_record,
     run_file_phase,
+    run_file_phase_sqlite,
 )
 from fastlink_transfer.state import TransferState
 
@@ -223,6 +227,153 @@ class SequenceClient:
     def rapid_upload(self, *, etag: str, size: int, file_name: str, parent_file_id: str):
         self.calls.append((etag, size, file_name, parent_file_id))
         return self.decisions.pop(0)
+
+
+def test_run_file_phase_updates_sqlite_state_in_batched_writer_commits(tmp_path):
+    state = open_or_initialize_import_state(
+        state_path=tmp_path / "import.state.sqlite3",
+        source_file="/tmp/export.json",
+        source_sha256="abc",
+        target_parent_id="12345678",
+        common_path="Demo/",
+    )
+    state.connection.executemany(
+        "INSERT OR REPLACE INTO folders (folder_key, parent_key, remote_folder_id, status, last_error) VALUES (?, ?, ?, ?, ?)",
+        [
+            ("", "", "12345678", "created", None),
+            ("Demo", "", "200", "created", None),
+            ("Demo/a", "Demo", "201", "created", None),
+        ],
+    )
+    state.connection.executemany(
+        "INSERT INTO files (record_key, path, file_name, relative_parent_dir, etag_hex, size, status, error, retries) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("k1", "a/one.txt", "one.txt", "a", "0123456789abcdef0123456789abcdef", 1, "pending", None, 0),
+            ("k2", "a/two.txt", "two.txt", "a", "fedcba9876543210fedcba9876543210", 2, "pending", None, 0),
+        ],
+    )
+    state.connection.execute("UPDATE job SET planning_complete = 1, total_files = 2")
+    state.connection.commit()
+    state.refresh_folder_map()
+    state.workers = 2
+    client = SequenceClient(
+        [
+            Decision(kind=DecisionKind.COMPLETED),
+            Decision(kind=DecisionKind.NOT_REUSABLE, error="Reuse=false"),
+        ]
+    )
+
+    summary = run_file_phase_sqlite(
+        api_client=client,
+        state=state,
+        max_retries=0,
+        flush_every=2,
+    )
+
+    assert summary == {"processed": 2, "credential_fatal": False}
+    assert state.fetch_status_counts() == {
+        "pending": 0,
+        "completed": 1,
+        "not_reusable": 1,
+        "failed": 0,
+    }
+    assert state.stats == {
+        "total": 2,
+        "completed": 1,
+        "not_reusable": 1,
+        "failed": 0,
+    }
+
+
+def test_run_file_phase_sqlite_rolls_back_partial_terminal_updates_when_job_counter_flush_fails(
+    tmp_path,
+):
+    state_path = tmp_path / "import.state.sqlite3"
+    state = open_or_initialize_import_state(
+        state_path=state_path,
+        source_file="/tmp/export.json",
+        source_sha256="abc",
+        target_parent_id="12345678",
+        common_path="Demo/",
+    )
+    state.connection.executemany(
+        "INSERT OR REPLACE INTO folders (folder_key, parent_key, remote_folder_id, status, last_error) VALUES (?, ?, ?, ?, ?)",
+        [
+            ("", "", "12345678", "created", None),
+            ("Demo", "", "200", "created", None),
+            ("Demo/a", "Demo", "201", "created", None),
+        ],
+    )
+    state.connection.execute(
+        "INSERT INTO files (record_key, path, file_name, relative_parent_dir, etag_hex, size, status, error, retries) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("k1", "a/one.txt", "one.txt", "a", "0123456789abcdef0123456789abcdef", 1, "pending", None, 0),
+    )
+    state.connection.execute(
+        "UPDATE job SET planning_complete = 1, total_files = 1, total_folders = 2"
+    )
+    state.connection.execute(
+        "CREATE TRIGGER fail_job_counter_update BEFORE UPDATE ON job "
+        "WHEN NEW.completed_count != OLD.completed_count "
+        "BEGIN SELECT RAISE(ABORT, 'forced job counter failure'); END"
+    )
+    state.connection.commit()
+    state.refresh_folder_map()
+    state.workers = 1
+    client = SequenceClient([Decision(kind=DecisionKind.COMPLETED)])
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced job counter failure"):
+        run_file_phase_sqlite(
+            api_client=client,
+            state=state,
+            max_retries=0,
+            flush_every=1,
+        )
+
+    state.close()
+
+    reopened = open_or_initialize_import_state(
+        state_path=state_path,
+        source_file="/tmp/export.json",
+        source_sha256="abc",
+        target_parent_id="12345678",
+        common_path="Demo/",
+    )
+    try:
+        assert reopened.fetch_status_counts() == {
+            "pending": 1,
+            "completed": 0,
+            "not_reusable": 0,
+            "failed": 0,
+        }
+        assert reopened.stats == {
+            "total": 1,
+            "completed": 0,
+            "not_reusable": 0,
+            "failed": 0,
+        }
+    finally:
+        reopened.close()
+
+
+def test_finalize_import_job_writes_retry_export_for_remaining_unsuccessful_rows(tmp_path):
+    state = open_or_initialize_import_state(
+        state_path=tmp_path / "import.state.sqlite3",
+        source_file="/tmp/export.json",
+        source_sha256="abc",
+        target_parent_id="12345678",
+        common_path="Demo/",
+    )
+    state.connection.execute(
+        "INSERT INTO files (record_key, path, file_name, relative_parent_dir, etag_hex, size, status, error, retries) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("k1", "a/one.txt", "one.txt", "a", "0123456789abcdef0123456789abcdef", 1, "failed", "HTTP 500", 2),
+    )
+    state.connection.commit()
+    retry_export_path = tmp_path / "remaining.json"
+
+    wrote = finalize_import_job(state=state, retry_export_path=retry_export_path)
+
+    assert wrote is True
+    assert retry_export_path.exists()
 
 
 def test_stop_controller_claim_next_work_item_preserves_pending_queue_after_shutdown_starts():

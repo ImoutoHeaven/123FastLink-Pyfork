@@ -101,6 +101,19 @@ def validate_hex_etag(value: str) -> str:
     return value.lower()
 
 
+def normalize_import_record(
+    *,
+    path_value: str,
+    etag_value: str,
+    size_value: object,
+    uses_base62: bool,
+) -> tuple[str, str, int]:
+    normalized_path = normalize_relative_path(path_value)
+    etag_hex = decode_base62_to_hex(etag_value) if uses_base62 else validate_hex_etag(etag_value)
+    size = parse_size(size_value)
+    return normalized_path, etag_hex, size
+
+
 def load_export_file(path: Path) -> ExportData:
     raw_bytes = path.read_bytes()
     payload = json.loads(raw_bytes.decode("utf-8"))
@@ -130,13 +143,15 @@ def load_export_file(path: Path) -> ExportData:
         if not isinstance(path_value, str):
             raise ValueError("path must be a string")
 
-        normalized_path = normalize_relative_path(path_value)
+        normalized_path, etag, size = normalize_import_record(
+            path_value=path_value,
+            etag_value=etag_value,
+            size_value=file_entry.get("size"),
+            uses_base62=uses_base62,
+        )
         if normalized_path in seen_paths:
             raise ValueError(f"duplicate normalized path: {normalized_path}")
         seen_paths.add(normalized_path)
-
-        etag = decode_base62_to_hex(etag_value) if uses_base62 else validate_hex_etag(etag_value)
-        size = parse_size(file_entry.get("size"))
         path_parts = normalized_path.split("/")
         key = f"{normalized_path}\t{etag}\t{size}"
         records.append(

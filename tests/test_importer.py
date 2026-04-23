@@ -8,6 +8,7 @@ from fastlink_transfer.importer import (
     collect_folder_keys,
     decode_base62_to_hex,
     load_export_file,
+    normalize_import_record,
     parse_size,
     select_pending_records,
 )
@@ -135,6 +136,32 @@ def test_collect_folder_keys_ignores_empty_record_parent_dirs():
     )
 
     assert keys == ["Demo", "Demo/1983", "Demo/1983/06"]
+
+
+def test_normalize_import_record_normalizes_path_etag_and_size():
+    normalized_path, etag_hex, size = normalize_import_record(
+        path_value="1983\\06\\a.txt",
+        etag_value="0123456789abcdef0123456789abcdef",
+        size_value="5",
+        uses_base62=False,
+    )
+
+    assert normalized_path == "1983/06/a.txt"
+    assert etag_hex == "0123456789abcdef0123456789abcdef"
+    assert size == 5
+
+
+def test_normalize_import_record_decodes_base62_etags_when_requested():
+    normalized_path, etag_hex, size = normalize_import_record(
+        path_value="1983/06/a.txt",
+        etag_value="WiAkcJukpqBeKRKuXWRec",
+        size_value=9,
+        uses_base62=True,
+    )
+
+    assert normalized_path == "1983/06/a.txt"
+    assert etag_hex == "1ee55b32272de3728552308ab589f264"
+    assert size == 9
 
 
 def test_select_pending_records_skips_terminal_records_without_retry_failed():

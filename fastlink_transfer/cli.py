@@ -20,6 +20,18 @@ def build_parser() -> argparse.ArgumentParser:
     import_json.add_argument("--retry-failed", action="store_true")
     import_json.add_argument("--dry-run", action="store_true")
 
+    batch_import = subparsers.add_parser("batch-import-json")
+    batch_import.set_defaults(command="batch_import_json")
+    batch_import.add_argument("--input-dir", required=True)
+    batch_import.add_argument("--target-parent-id", required=True)
+    batch_import.add_argument("--state-dir", required=True)
+    batch_import.add_argument("--workers", type=int, default=8)
+    batch_import.add_argument("--json-parallelism", type=int, default=2)
+    batch_import.add_argument("--max-retries", type=int, default=5)
+    batch_import.add_argument("--flush-every", type=int, default=100)
+    batch_import.add_argument("--retry-failed", action="store_true")
+    batch_import.add_argument("--dry-run", action="store_true")
+
     export_json = subparsers.add_parser("export-json")
     export_json.set_defaults(command="export_json")
     export_json.add_argument("--source-parent-id", required=True)

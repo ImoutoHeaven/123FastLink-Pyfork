@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""In-memory transfer state used by the existing runner path.
+
+SQLite-backed import persistence now lives in ``fastlink_transfer.import_state``.
+This module keeps the runner-facing ``TransferState`` helpers until the CLI path
+is migrated in later task groups.
+"""
+
 import json
 import os
 import tempfile

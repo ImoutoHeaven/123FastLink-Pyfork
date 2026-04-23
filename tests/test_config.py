@@ -32,6 +32,51 @@ def test_build_command_config_normalizes_paths(tmp_path):
     )
 
 
+def test_build_command_config_builds_batch_import_json_config(tmp_path):
+    args = Namespace(
+        command="batch_import_json",
+        input_dir=str(tmp_path / "exports"),
+        target_parent_id="12345678",
+        state_dir=str(tmp_path / ".state" / "batch"),
+        workers=8,
+        json_parallelism=2,
+        max_retries=5,
+        flush_every=100,
+        retry_failed=False,
+        dry_run=False,
+    )
+
+    config = build_command_config(args)
+
+    assert config.command == "batch_import_json"
+    assert config.input_dir == (tmp_path / "exports").resolve()
+    assert config.target_parent_id == "12345678"
+    assert config.state_dir == (tmp_path / ".state" / "batch").resolve()
+    assert config.workers == 8
+    assert config.json_parallelism == 2
+
+
+@pytest.mark.parametrize("json_parallelism", [0, -1])
+def test_build_command_config_rejects_invalid_batch_json_parallelism(
+    tmp_path, json_parallelism
+):
+    args = Namespace(
+        command="batch_import_json",
+        input_dir=str(tmp_path / "exports"),
+        target_parent_id="12345678",
+        state_dir=str(tmp_path / ".state" / "batch"),
+        workers=8,
+        json_parallelism=json_parallelism,
+        max_retries=5,
+        flush_every=100,
+        retry_failed=False,
+        dry_run=False,
+    )
+
+    with pytest.raises(ValueError, match="json_parallelism must be >= 1"):
+        build_command_config(args)
+
+
 @pytest.mark.parametrize(
     "workers,max_retries,flush_every,target_parent_id",
     [

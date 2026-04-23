@@ -3,8 +3,10 @@ from __future__ import annotations
 import inspect
 import random
 import queue
+import sqlite3
 import threading
 import time
+from pathlib import Path
 
 from fastlink_transfer.api import DecisionKind, PanApiClient
 
@@ -14,6 +16,10 @@ def safe_print(message: str) -> None:
         print(message)
     except Exception:
         return
+
+
+class DirectoryPhaseCredentialFatalError(RuntimeError):
+    pass
 
 
 def create_remote_directories(*, api_client, state, folder_keys: list[str], state_path, max_retries: int = 0) -> None:
@@ -32,6 +38,10 @@ def create_remote_directories(*, api_client, state, folder_keys: list[str], stat
                 state.flush(state_path)
                 safe_print(f"State flush: folder_map_size={len(state.folder_map)}")
                 break
+            if decision.kind == DecisionKind.CREDENTIAL_FATAL:
+                raise DirectoryPhaseCredentialFatalError(
+                    f"directory creation failed: {folder_key}: {decision.error}"
+                )
             if decision.kind != DecisionKind.RETRYABLE or attempts >= max_retries:
                 raise RuntimeError(f"directory creation failed: {folder_key}: {decision.error}")
             attempts += 1
@@ -402,4 +412,221 @@ def run_file_phase(*, api_client, state, records, state_path, max_retries: int, 
             flush_error=flush_error,
         )
         raise
+    return {"processed": processed_count, "credential_fatal": stop_controller.credential_fatal}
+
+
+def finalize_import_job(*, state, retry_export_path: Path) -> bool:
+    return state.write_retry_export(retry_export_path)
+
+
+def run_file_phase_sqlite(*, api_client, state, max_retries: int, flush_every: int) -> dict[str, int | bool]:
+    stop_controller = StopController()
+    global_pause = GlobalPause()
+    batch_size = max(flush_every, state.workers, 1)
+    work_queue: queue.Queue = queue.Queue(maxsize=batch_size)
+    outcome_queue: queue.Queue = queue.Queue()
+    processed_count = 0
+    processed_count_lock = threading.Lock()
+    terminal_lock = threading.Lock()
+    exception_lock = threading.Lock()
+    worker_exception: Exception | None = None
+    producer_done = threading.Event()
+    workers_done = threading.Event()
+
+    def flush_outcomes(outcomes: list[dict[str, str | int | None]], *, is_final: bool) -> None:
+        nonlocal processed_count
+        if outcomes:
+            with terminal_lock:
+                state.flush_terminal_outcomes(outcomes)
+                with processed_count_lock:
+                    processed_count += len(outcomes)
+                    current_count = processed_count
+                safe_print(
+                    f"File progress: completed={state.stats['completed']} "
+                    f"not_reusable={state.stats['not_reusable']} failed={state.stats['failed']}"
+                )
+                if not is_final:
+                    safe_print(f"State flush: terminal_outcomes={current_count}")
+        if is_final:
+            with terminal_lock:
+                state.flush(state.state_path)
+                with processed_count_lock:
+                    current_count = processed_count
+                safe_print(f"State flush: final terminal_outcomes={current_count}")
+
+    def producer() -> None:
+        last_path: str | None = None
+        read_connection: sqlite3.Connection | None = None
+        try:
+            read_connection = sqlite3.connect(state.state_path)
+            while True:
+                query = (
+                    "SELECT record_key, etag_hex, size, path, file_name, relative_parent_dir "
+                    "FROM files WHERE status = 'pending'"
+                )
+                parameters: tuple[object, ...]
+                if last_path is None:
+                    query += " ORDER BY path ASC LIMIT ?"
+                    parameters = (batch_size,)
+                else:
+                    query += " AND path > ? ORDER BY path ASC LIMIT ?"
+                    parameters = (last_path, batch_size)
+                rows = read_connection.execute(query, parameters).fetchall()
+                if not rows:
+                    return
+                for record_key, etag_hex, size, path, file_name, relative_parent_dir in rows:
+                    record = type("Record", (), {})()
+                    record.key = str(record_key)
+                    record.etag = str(etag_hex)
+                    record.size = int(size)
+                    record.path = str(path)
+                    record.file_name = str(file_name)
+                    record.relative_parent_dir = str(relative_parent_dir)
+                    parent_file_id = state.resolve_parent_file_id(
+                        relative_parent_dir=record.relative_parent_dir
+                    )
+                    while True:
+                        if stop_controller.shutdown_started():
+                            return
+                        try:
+                            work_queue.put((record, parent_file_id), timeout=0.05)
+                            break
+                        except queue.Full:
+                            continue
+                last_path = str(rows[-1][3])
+        except Exception as exc:
+            nonlocal worker_exception
+            with exception_lock:
+                if worker_exception is None:
+                    worker_exception = exc
+            stop_controller.start_shutdown()
+        finally:
+            if read_connection is not None:
+                read_connection.close()
+            producer_done.set()
+
+    def record_terminal_outcome(result: str, *, record, error: str | None, retries: int) -> None:
+        outcome_queue.put(
+            {
+                "result": result,
+                "record_key": record.key,
+                "error": error,
+                "retries": retries,
+            }
+        )
+
+    def worker() -> None:
+        nonlocal worker_exception
+        while True:
+            got_work_item = False
+            try:
+                if stop_controller.shutdown_started():
+                    return
+                if not global_pause.wait(stop_controller=stop_controller):
+                    if stop_controller.shutdown_started():
+                        return
+                if stop_controller.shutdown_started():
+                    return
+                claimed_item = stop_controller.claim_next_work_item(work_queue)
+                if claimed_item is None:
+                    if stop_controller.shutdown_started() or producer_done.is_set():
+                        return
+                    continue
+                record, parent_file_id = claimed_item
+                got_work_item = True
+                process_record(
+                    api_client=api_client,
+                    state=state,
+                    record=record,
+                    parent_file_id=parent_file_id,
+                    max_retries=max_retries,
+                    stop_controller=stop_controller,
+                    global_pause=global_pause,
+                    on_terminal_outcome=record_terminal_outcome,
+                )
+            except queue.Empty:
+                if producer_done.is_set():
+                    return
+                continue
+            except Exception as exc:
+                with exception_lock:
+                    if worker_exception is None:
+                        worker_exception = exc
+                stop_controller.start_shutdown()
+                return
+            finally:
+                if got_work_item:
+                    work_queue.task_done()
+
+    def writer() -> None:
+        nonlocal worker_exception
+        pending_outcomes: list[dict[str, str | int | None]] = []
+        try:
+            while True:
+                try:
+                    outcome = outcome_queue.get(timeout=0.05)
+                except queue.Empty:
+                    if producer_done.is_set() and workers_done.is_set() and outcome_queue.empty():
+                        break
+                    continue
+                pending_outcomes.append(outcome)
+                outcome_queue.task_done()
+                if len(pending_outcomes) >= flush_every:
+                    flush_outcomes(pending_outcomes, is_final=False)
+                    pending_outcomes = []
+            flush_outcomes(pending_outcomes, is_final=True)
+        except Exception as exc:
+            with exception_lock:
+                if worker_exception is None:
+                    worker_exception = exc
+            stop_controller.start_shutdown()
+
+    producer_thread = threading.Thread(target=producer, daemon=False)
+    writer_thread = threading.Thread(target=writer, daemon=False)
+    worker_threads = [threading.Thread(target=worker, daemon=False) for _ in range(state.workers)]
+    all_threads = [producer_thread, writer_thread, *worker_threads]
+
+    try:
+        for thread in all_threads:
+            thread.start()
+        for thread in worker_threads:
+            thread.join()
+        workers_done.set()
+        producer_done.set()
+        producer_thread.join()
+        writer_thread.join()
+    except KeyboardInterrupt as exc:
+        stop_controller.start_shutdown()
+        producer_done.set()
+        workers_done.set()
+        for thread in all_threads:
+            if thread.is_alive():
+                thread.join()
+        flush_error = _flush_state_best_effort(
+            state=state,
+            state_path=state.state_path,
+            terminal_lock=terminal_lock,
+            success_message="State flush: keyboard interrupt",
+        )
+        _add_flush_failure_note(
+            exc,
+            note_prefix="Best-effort keyboard interrupt flush failed",
+            flush_error=flush_error,
+        )
+        raise
+
+    if worker_exception is not None:
+        flush_error = _flush_state_best_effort(
+            state=state,
+            state_path=state.state_path,
+            terminal_lock=terminal_lock,
+            success_message=f"State flush: worker exception terminal_outcomes={processed_count}",
+        )
+        _add_flush_failure_note(
+            worker_exception,
+            note_prefix="Best-effort final flush failed",
+            flush_error=flush_error,
+        )
+        raise worker_exception
+
     return {"processed": processed_count, "credential_fatal": stop_controller.credential_fatal}
