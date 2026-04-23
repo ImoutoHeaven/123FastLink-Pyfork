@@ -8,6 +8,7 @@ from fastlink_transfer.api import Decision, DecisionKind
 from fastlink_transfer.batch_import import (
     BatchJob,
     BatchRunSummary,
+    _open_planned_state_for_job,
     discover_batch_json_jobs,
     run_batch_import_cli,
     run_batch_import_jobs,
@@ -488,3 +489,162 @@ def test_run_batch_import_cli_treats_shared_state_root_failure_as_batch_fatal_st
     assert "blocked-state-root" in output
     assert "Batch preflight failed:" not in output
     assert "Batch summary:" not in output
+
+
+def test_open_planned_state_for_new_job_skips_separate_scope_scan(monkeypatch, tmp_path):
+    input_dir = tmp_path / "exports"
+    input_dir.mkdir()
+    _write_export_json(
+        input_dir / "demo.json",
+        common_path="Demo/",
+        files=[{"etag": "0123456789abcdef0123456789abcdef", "size": "5", "path": "a.txt"}],
+    )
+    config = BatchImportJsonConfig(
+        command="batch_import_json",
+        input_dir=input_dir,
+        target_parent_id="12345678",
+        state_dir=tmp_path / ".state" / "batch",
+        workers=8,
+        json_parallelism=1,
+        max_retries=0,
+        flush_every=100,
+        retry_failed=False,
+        dry_run=True,
+    )
+    job = discover_batch_json_jobs(input_dir=input_dir, state_dir=config.state_dir)[0]
+    monkeypatch.setattr(
+        "fastlink_transfer.batch_import.inspect_export_scope",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("new-state planning should not do a separate scope scan")),
+    )
+
+    state = _open_planned_state_for_job(job=job, config=config)
+
+    assert state.job_scope == {
+        "source_sha256": state.job_scope["source_sha256"],
+        "target_parent_id": "12345678",
+        "common_path": "Demo/",
+    }
+    assert len(state.job_scope["source_sha256"]) == 64
+    assert state.fetch_pending_record_paths() == ["a.txt"]
+
+
+def test_run_batch_import_cli_reuses_shared_remote_directory_across_jobs(monkeypatch, tmp_path, capsys):
+    input_dir = tmp_path / "exports"
+    input_dir.mkdir()
+    _write_export_json(
+        input_dir / "one.json",
+        common_path="Demo/",
+        files=[{"etag": "0123456789abcdef0123456789abcdef", "size": "5", "path": "one.txt"}],
+    )
+    _write_export_json(
+        input_dir / "two.json",
+        common_path="Demo/",
+        files=[{"etag": "fedcba9876543210fedcba9876543210", "size": "6", "path": "two.txt"}],
+    )
+    config = BatchImportJsonConfig(
+        command="batch_import_json",
+        input_dir=input_dir,
+        target_parent_id="12345678",
+        state_dir=tmp_path / ".state" / "batch",
+        workers=8,
+        json_parallelism=1,
+        max_retries=0,
+        flush_every=100,
+        retry_failed=False,
+        dry_run=False,
+    )
+    mkdir_calls = []
+    list_calls = []
+
+    monkeypatch.setattr(
+        "fastlink_transfer.batch_import.load_credentials",
+        lambda: SimpleNamespace(host="https://www.123pan.com"),
+    )
+    monkeypatch.setattr("fastlink_transfer.batch_import.build_session", lambda creds: object())
+
+    class ReusingClient:
+        def __init__(self, host, session):
+            self.host = host
+            self.session = session
+
+        def get_file_list(self, *, parent_file_id: str):
+            list_calls.append(parent_file_id)
+            return Decision(kind=DecisionKind.COMPLETED, payload={"items": [], "total": 0})
+
+        def mkdir(self, *, parent_file_id: str, folder_name: str):
+            mkdir_calls.append((parent_file_id, folder_name))
+            return Decision(kind=DecisionKind.DIRECTORY_CREATED, file_id="200")
+
+        def rapid_upload(self, *, etag: str, size: int, file_name: str, parent_file_id: str):
+            return Decision(kind=DecisionKind.COMPLETED, file_id=f"{file_name}-id")
+
+    monkeypatch.setattr("fastlink_transfer.batch_import.PanApiClient", ReusingClient)
+
+    assert run_batch_import_cli(config=config) == 0
+    output = capsys.readouterr().out
+    assert mkdir_calls == [("12345678", "Demo")]
+    assert list_calls == ["12345678"]
+    assert "Batch summary: total=2 completed=2 completed_with_not_reusable=0 failed=0" in output
+
+
+def test_run_batch_import_cli_retry_failed_checks_collisions_for_requeued_rows(
+    monkeypatch, tmp_path, capsys
+):
+    input_dir = tmp_path / "exports"
+    input_dir.mkdir()
+    _write_export_json(
+        input_dir / "one.json",
+        common_path="Demo/",
+        files=[{"etag": "0123456789abcdef0123456789abcdef", "size": "5", "path": "one.txt"}],
+    )
+    _write_export_json(
+        input_dir / "two.json",
+        common_path="Demo/",
+        files=[{"etag": "fedcba9876543210fedcba9876543210", "size": "6", "path": "two.txt"}],
+    )
+    config = BatchImportJsonConfig(
+        command="batch_import_json",
+        input_dir=input_dir,
+        target_parent_id="12345678",
+        state_dir=tmp_path / ".state" / "batch",
+        workers=8,
+        json_parallelism=1,
+        max_retries=0,
+        flush_every=100,
+        retry_failed=True,
+        dry_run=True,
+    )
+    jobs = discover_batch_json_jobs(input_dir=input_dir, state_dir=config.state_dir)
+    for job in jobs:
+        state = _open_planned_state_for_job(job=job, config=config)
+        state.connection.execute(
+            "UPDATE files SET status = 'failed', error = 'HTTP 500' WHERE path = ?",
+            ("one.txt" if job.relative_json_path.name == "one.json" else "two.txt",),
+        )
+        state.connection.execute(
+            "INSERT INTO files (record_key, path, file_name, relative_parent_dir, etag_hex, size, status, error, retries) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"extra-{job.relative_json_path.name}",
+                "collision.txt",
+                "collision.txt",
+                "",
+                "0123456789abcdef0123456789abcdef",
+                1,
+                "failed",
+                "HTTP 500",
+                1,
+            ),
+        )
+        state.connection.execute(
+            "UPDATE job SET total_files = total_files + 1, failed_count = failed_count + 2 WHERE singleton = 1"
+        )
+        state.connection.commit()
+        state.close()
+    monkeypatch.setattr(
+        "fastlink_transfer.batch_import.load_credentials",
+        lambda: (_ for _ in ()).throw(AssertionError("collision preflight should stop before credentials")),
+    )
+
+    assert run_batch_import_cli(config=config) == 1
+    output = capsys.readouterr().out
+    assert "target path collision: Demo/collision.txt" in output

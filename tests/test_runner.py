@@ -11,6 +11,7 @@ from fastlink_transfer.api import Decision, DecisionKind, PanApiClient
 from fastlink_transfer.import_state import open_or_initialize_import_state
 from fastlink_transfer.importer import SourceRecord, load_export_file, select_pending_records
 from fastlink_transfer.runner import (
+    DirectoryCoordinator,
     GlobalPause,
     StopController,
     create_remote_directories,
@@ -141,6 +142,25 @@ class SequenceDirectoryClient:
         return self.decisions.pop(0)
 
 
+class ListingDirectoryClient:
+    def __init__(self, *, listings=None, mkdir_decisions=None):
+        self.listings = dict(listings or {})
+        self.mkdir_decisions = list(mkdir_decisions or [])
+        self.get_file_list_calls = []
+        self.mkdir_calls = []
+
+    def get_file_list(self, *, parent_file_id: str):
+        self.get_file_list_calls.append(parent_file_id)
+        items = self.listings.get(parent_file_id, [])
+        return Decision(kind=DecisionKind.COMPLETED, payload={"items": items, "total": len(items)})
+
+    def mkdir(self, *, parent_file_id: str, folder_name: str):
+        self.mkdir_calls.append((parent_file_id, folder_name))
+        if self.mkdir_decisions:
+            return self.mkdir_decisions.pop(0)
+        return Decision(kind=DecisionKind.DIRECTORY_CREATED, file_id=str(len(self.mkdir_calls)))
+
+
 def test_create_remote_directories_retries_retryable_failure_before_succeeding(monkeypatch, tmp_path):
     monkeypatch.setattr("fastlink_transfer.runner.compute_backoff", lambda _attempt: 1.25)
     sleep_calls = []
@@ -176,6 +196,97 @@ def test_create_remote_directories_retries_retryable_failure_before_succeeding(m
     assert client.calls == [("100", "Demo"), ("100", "Demo")]
     assert sleep_calls == [1.25]
     assert state.folder_map["Demo"] == "7"
+
+
+def test_create_remote_directories_reuses_existing_remote_directory_before_mkdir(tmp_path):
+    client = ListingDirectoryClient(
+        listings={
+            "100": [{"FileId": 200, "Type": 1, "FileName": "Demo"}],
+        }
+    )
+    state = TransferState(
+        source_file="a",
+        source_sha256="abc",
+        target_parent_id="100",
+        common_path="Demo/",
+        workers=8,
+        folder_map={"": "100"},
+        completed=set(),
+        not_reusable={},
+        failed={},
+        stats={"total": 0, "completed": 0, "not_reusable": 0, "failed": 0},
+        last_flush_at=None,
+    )
+
+    create_remote_directories(
+        api_client=client,
+        state=state,
+        folder_keys=["Demo"],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert client.get_file_list_calls == ["100"]
+    assert client.mkdir_calls == []
+    assert state.folder_map["Demo"] == "200"
+
+
+def test_create_remote_directories_reuses_batch_global_directory_cache_across_states(tmp_path):
+    coordinator = DirectoryCoordinator()
+    client = ListingDirectoryClient(
+        listings={
+            "100": [],
+            "1": [],
+        },
+        mkdir_decisions=[
+            Decision(kind=DecisionKind.DIRECTORY_CREATED, file_id="1"),
+            Decision(kind=DecisionKind.DIRECTORY_CREATED, file_id="2"),
+        ],
+    )
+    state_one = TransferState(
+        source_file="a",
+        source_sha256="abc",
+        target_parent_id="100",
+        common_path="Demo/",
+        workers=8,
+        folder_map={"": "100"},
+        completed=set(),
+        not_reusable={},
+        failed={},
+        stats={"total": 0, "completed": 0, "not_reusable": 0, "failed": 0},
+        last_flush_at=None,
+    )
+    state_two = TransferState(
+        source_file="b",
+        source_sha256="def",
+        target_parent_id="100",
+        common_path="Demo/",
+        workers=8,
+        folder_map={"": "100"},
+        completed=set(),
+        not_reusable={},
+        failed={},
+        stats={"total": 0, "completed": 0, "not_reusable": 0, "failed": 0},
+        last_flush_at=None,
+    )
+
+    create_remote_directories(
+        api_client=client,
+        state=state_one,
+        folder_keys=["Demo", "Demo/1983"],
+        state_path=tmp_path / "one.state.json",
+        directory_coordinator=coordinator,
+    )
+    create_remote_directories(
+        api_client=client,
+        state=state_two,
+        folder_keys=["Demo", "Demo/1983"],
+        state_path=tmp_path / "two.state.json",
+        directory_coordinator=coordinator,
+    )
+
+    assert client.get_file_list_calls == ["100", "1"]
+    assert client.mkdir_calls == [("100", "Demo"), ("1", "1983")]
+    assert state_two.folder_map == {"": "100", "Demo": "1", "Demo/1983": "2"}
 
 
 @pytest.mark.parametrize(

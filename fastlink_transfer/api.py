@@ -163,8 +163,6 @@ class PanApiClient:
             "type": 1,
             "duplicate": 1,
             "NotReuse": True,
-            "event": "newCreateFolder",
-            "operateType": 1,
             "RequestSource": None,
         }
         try:

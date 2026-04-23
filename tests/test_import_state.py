@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from fastlink_transfer.import_state import (
     MALFORMED_STATE_ERROR,
     SQLITE_HEADER,
     _is_sqlite_file,
+    initialize_import_state_for_planning,
     open_or_initialize_import_state,
 )
 
@@ -80,6 +82,93 @@ def test_open_or_initialize_import_state_reopens_existing_sqlite_state_for_match
         "target_parent_id": "12345678",
         "common_path": "Demo/",
     }
+
+
+def test_initialize_import_state_for_planning_cleans_up_partial_file_on_keyboard_interrupt(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "import.state.sqlite3"
+    real_connect = sqlite3.connect
+
+    class InterruptingConnection:
+        def __init__(self, path: Path):
+            self._path = path
+
+        def execute(self, sql, params=()):
+            if str(sql).startswith("PRAGMA"):
+                return None
+            raise AssertionError(f"unexpected execute: {sql}")
+
+        def executescript(self, sql):
+            self._path.write_bytes(b"partial")
+            raise KeyboardInterrupt()
+
+        def commit(self):
+            raise AssertionError("commit should not run after interrupt")
+
+        def close(self):
+            return None
+
+    def fake_connect(path, check_same_thread=False):
+        if Path(path) == state_path:
+            return InterruptingConnection(state_path)
+        return real_connect(path, check_same_thread=check_same_thread)
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+
+    with pytest.raises(KeyboardInterrupt):
+        initialize_import_state_for_planning(
+            state_path=state_path,
+            source_file="/tmp/export.json",
+            target_parent_id="12345678",
+        )
+
+    assert state_path.exists() is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_open_or_initialize_import_state_cleans_up_new_state_when_metadata_update_is_interrupted(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "import.state.sqlite3"
+    original_initializer = initialize_import_state_for_planning
+
+    class InterruptingImportState:
+        def __init__(self, wrapped):
+            self.connection = self
+            self.state_path = wrapped.state_path
+            self.folder_map = wrapped.folder_map
+
+        def execute(self, sql, params=()):
+            if str(sql).startswith("UPDATE job SET source_sha256"):
+                raise KeyboardInterrupt()
+            raise AssertionError(f"unexpected execute: {sql}")
+
+        def commit(self):
+            raise AssertionError("commit should not run after interrupt")
+
+        def close(self):
+            return None
+
+    def fake_initializer(**kwargs):
+        wrapped = original_initializer(**kwargs)
+        return InterruptingImportState(wrapped)
+
+    monkeypatch.setattr(
+        "fastlink_transfer.import_state.initialize_import_state_for_planning",
+        fake_initializer,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        open_or_initialize_import_state(
+            state_path=state_path,
+            source_file="/tmp/export.json",
+            source_sha256="abc",
+            target_parent_id="12345678",
+            common_path="Demo/",
+        )
+
+    assert state_path.exists() is False
 
 
 def test_open_or_initialize_import_state_rejects_non_sqlite_state_file(tmp_path):
@@ -693,6 +782,59 @@ def test_retry_failed_resets_failed_and_not_reusable_rows_to_pending(tmp_path):
         ("k1", "pending", None, 0),
         ("k2", "pending", None, 0),
     ]
+
+
+def test_retry_failed_keeps_duplicate_normalized_file_path_rows_terminal(tmp_path):
+    state = open_or_initialize_import_state(
+        state_path=tmp_path / "import.state.sqlite3",
+        source_file="/tmp/export.json",
+        source_sha256="abc",
+        target_parent_id="12345678",
+        common_path="Demo/",
+    )
+    state.connection.executemany(
+        "INSERT INTO files (record_key, path, file_name, relative_parent_dir, etag_hex, size, status, error, retries) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "k1",
+                "1983/06/a.txt",
+                "a.txt",
+                "1983/06",
+                "0123456789abcdef0123456789abcdef",
+                1,
+                "failed",
+                "duplicate normalized file path",
+                0,
+            ),
+            (
+                "k2",
+                "1983/07/b.txt",
+                "b.txt",
+                "1983/07",
+                "fedcba9876543210fedcba9876543210",
+                2,
+                "failed",
+                "HTTP 500",
+                2,
+            ),
+        ],
+    )
+    state.connection.execute(
+        "UPDATE job SET total_files = 2, failed_count = 2 WHERE singleton = 1"
+    )
+    state.connection.commit()
+
+    state.reset_retryable_rows()
+
+    rows = state.connection.execute(
+        "SELECT record_key, status, error, retries FROM files ORDER BY record_key ASC"
+    ).fetchall()
+
+    assert rows == [
+        ("k1", "failed", "duplicate normalized file path", 0),
+        ("k2", "pending", None, 0),
+    ]
+    assert state.count_pending_files(retry_failed=True) == 1
 
 
 def test_planning_helpers_manage_folder_and_pending_row_views(tmp_path):

@@ -22,22 +22,100 @@ class DirectoryPhaseCredentialFatalError(RuntimeError):
     pass
 
 
-def create_remote_directories(*, api_client, state, folder_keys: list[str], state_path, max_retries: int = 0) -> None:
-    for folder_key in folder_keys:
-        if folder_key in state.folder_map:
-            continue
+class DirectoryCoordinator:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._folder_map: dict[str, str] = {}
+        self._children_by_parent: dict[str, dict[str, str]] = {}
+
+    def resolve(self, *, api_client, state, folder_key: str, max_retries: int) -> str:
         parent_key = folder_key.rsplit("/", 1)[0] if "/" in folder_key else ""
         folder_name = folder_key.split("/")[-1]
-        parent_file_id = state.folder_map[parent_key]
+
+        with self._lock:
+            self._folder_map.setdefault("", state.target_parent_id)
+            if parent_key in self._folder_map and parent_key not in state.folder_map:
+                state.folder_map[parent_key] = self._folder_map[parent_key]
+            cached = self._folder_map.get(folder_key)
+            if cached is not None:
+                return cached
+
+            parent_file_id = state.folder_map[parent_key]
+            children = self._children_by_parent.get(parent_file_id)
+            if children is None:
+                children = self._fetch_existing_directories(
+                    api_client=api_client,
+                    parent_file_id=parent_file_id,
+                    folder_key=folder_key,
+                    max_retries=max_retries,
+                )
+                self._children_by_parent[parent_file_id] = children
+            existing = children.get(folder_name)
+            if existing is not None:
+                self._folder_map[folder_key] = existing
+                return existing
+
+            created = self._mkdir_with_retry(
+                api_client=api_client,
+                parent_file_id=parent_file_id,
+                folder_name=folder_name,
+                folder_key=folder_key,
+                max_retries=max_retries,
+            )
+            children[folder_name] = created
+            self._folder_map[folder_key] = created
+            return created
+
+    def _fetch_existing_directories(
+        self,
+        *,
+        api_client,
+        parent_file_id: str,
+        folder_key: str,
+        max_retries: int,
+    ) -> dict[str, str]:
+        if not hasattr(api_client, "get_file_list"):
+            return {}
+        attempts = 0
+        while True:
+            decision = api_client.get_file_list(parent_file_id=parent_file_id)
+            if decision.kind == DecisionKind.COMPLETED:
+                items = decision.payload.get("items") if isinstance(decision.payload, dict) else None
+                if not isinstance(items, list):
+                    raise RuntimeError(f"directory lookup failed: {folder_key}: missing items")
+                directories = {}
+                for item in items:
+                    if not isinstance(item, dict) or item.get("Type") != 1:
+                        continue
+                    name = item.get("FileName")
+                    file_id = item.get("FileId")
+                    if isinstance(name, str) and file_id is not None:
+                        directories[name] = str(file_id)
+                return directories
+            if decision.kind == DecisionKind.CREDENTIAL_FATAL:
+                raise DirectoryPhaseCredentialFatalError(
+                    f"directory lookup failed: {folder_key}: {decision.error}"
+                )
+            if decision.kind != DecisionKind.RETRYABLE or attempts >= max_retries:
+                raise RuntimeError(f"directory lookup failed: {folder_key}: {decision.error}")
+            attempts += 1
+            time.sleep(compute_backoff(attempts))
+
+    def _mkdir_with_retry(
+        self,
+        *,
+        api_client,
+        parent_file_id: str,
+        folder_name: str,
+        folder_key: str,
+        max_retries: int,
+    ) -> str:
         attempts = 0
         while True:
             safe_print(f"Directory progress: creating={folder_key}")
             decision = api_client.mkdir(parent_file_id=parent_file_id, folder_name=folder_name)
             if decision.kind == DecisionKind.DIRECTORY_CREATED:
-                state.folder_map[folder_key] = decision.file_id
-                state.flush(state_path)
-                safe_print(f"State flush: folder_map_size={len(state.folder_map)}")
-                break
+                return decision.file_id
             if decision.kind == DecisionKind.CREDENTIAL_FATAL:
                 raise DirectoryPhaseCredentialFatalError(
                     f"directory creation failed: {folder_key}: {decision.error}"
@@ -46,6 +124,32 @@ def create_remote_directories(*, api_client, state, folder_keys: list[str], stat
                 raise RuntimeError(f"directory creation failed: {folder_key}: {decision.error}")
             attempts += 1
             time.sleep(compute_backoff(attempts))
+
+
+def create_remote_directories(
+    *,
+    api_client,
+    state,
+    folder_keys: list[str],
+    state_path,
+    max_retries: int = 0,
+    directory_coordinator: DirectoryCoordinator | None = None,
+) -> None:
+    coordinator = directory_coordinator or DirectoryCoordinator()
+    for folder_key in folder_keys:
+        if folder_key in state.folder_map:
+            continue
+        file_id = coordinator.resolve(
+            api_client=api_client,
+            state=state,
+            folder_key=folder_key,
+            max_retries=max_retries,
+        )
+        if state.folder_map.get(folder_key) == file_id:
+            continue
+        state.folder_map[folder_key] = file_id
+        state.flush(state_path)
+        safe_print(f"State flush: folder_map_size={len(state.folder_map)}")
 
 
 def compute_backoff(attempt: int) -> float:

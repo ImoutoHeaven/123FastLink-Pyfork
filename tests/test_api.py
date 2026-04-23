@@ -222,8 +222,6 @@ def test_mkdir_posts_frozen_payload():
                 "type": 1,
                 "duplicate": 1,
                 "NotReuse": True,
-                "event": "newCreateFolder",
-                "operateType": 1,
                 "RequestSource": None,
             },
         )

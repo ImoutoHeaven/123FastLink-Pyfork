@@ -7,9 +7,10 @@ import threading
 
 from fastlink_transfer.api import PanApiClient
 from fastlink_transfer.auth import build_session, load_credentials
-from fastlink_transfer.import_planner import inspect_export_scope, rebuild_incomplete_plan_if_needed
-from fastlink_transfer.import_state import open_or_initialize_import_state
+from fastlink_transfer.import_planner import inspect_export_scope, plan_import_into_new_state, rebuild_incomplete_plan_if_needed
+from fastlink_transfer.import_state import initialize_import_state_for_planning, open_or_initialize_import_state
 from fastlink_transfer.runner import (
+    DirectoryCoordinator,
     DirectoryPhaseCredentialFatalError,
     create_remote_directories,
     finalize_import_job,
@@ -229,6 +230,7 @@ def run_batch_import_cli(*, config) -> int:
         state = None
         try:
             state = _open_planned_state_for_job(job=job, config=config)
+            state.retry_failed = bool(config.retry_failed)
             planned_files_by_job[job] = _fetch_planned_target_paths(state=state)
             planned_directories_by_job[job] = _fetch_planned_directory_paths(state=state)
             planned_jobs.append(job)
@@ -277,6 +279,7 @@ def run_batch_import_cli(*, config) -> int:
         return 1
 
     try:
+        directory_coordinator = DirectoryCoordinator()
         execution_summary = run_batch_import_jobs(
             jobs=planned_jobs,
             json_parallelism=config.json_parallelism,
@@ -285,6 +288,7 @@ def run_batch_import_cli(*, config) -> int:
                 config=config,
                 creds=creds,
                 session=session,
+                directory_coordinator=directory_coordinator,
                 **kwargs,
             ),
         )
@@ -314,7 +318,12 @@ def _child_status_for_state(*, state, credential_fatal: bool) -> str:
 
 def _fetch_planned_target_paths(*, state) -> list[str]:
     common_path = state.job_scope["common_path"].rstrip("/")
-    rows = state.connection.execute("SELECT path FROM files ORDER BY path ASC").fetchall()
+    if getattr(state, "retry_failed", False):
+        rows = state.connection.execute(
+            "SELECT path FROM files WHERE status = 'pending' OR status = 'not_reusable' OR (status = 'failed' AND error <> 'duplicate normalized file path') ORDER BY path ASC"
+        ).fetchall()
+    else:
+        rows = state.connection.execute("SELECT path FROM files WHERE status = 'pending' ORDER BY path ASC").fetchall()
     paths = []
     for row in rows:
         relative_path = str(row[0])
@@ -351,6 +360,16 @@ def _validate_batch_state_dir_layout(*, input_dir: Path, state_dir: Path) -> Non
 
 
 def _open_planned_state_for_job(*, job: BatchJob, config):
+    if not job.state_path.exists():
+        state = initialize_import_state_for_planning(
+            state_path=job.state_path,
+            source_file=str(job.json_path),
+            target_parent_id=config.target_parent_id,
+        )
+        state.workers = config.workers
+        plan_import_into_new_state(export_path=job.json_path, state=state)
+        return state
+
     scope = inspect_export_scope(export_path=job.json_path)
     state = open_or_initialize_import_state(
         state_path=job.state_path,
@@ -387,7 +406,7 @@ def _ensure_batch_state_root(*, state_dir: Path) -> None:
         raise ValueError(f"state-root error: {state_dir}: {exc}") from exc
 
 
-def _run_child_job(*, job: BatchJob, config, creds, session) -> _BatchChildResult:
+def _run_child_job(*, job: BatchJob, config, creds, session, directory_coordinator: DirectoryCoordinator) -> _BatchChildResult:
     state = None
     credential_fatal = False
     retry_export_path: Path | None = None
@@ -406,6 +425,7 @@ def _run_child_job(*, job: BatchJob, config, creds, session) -> _BatchChildResul
             folder_keys=pending_folder_keys,
             state_path=job.state_path,
             max_retries=config.max_retries,
+            directory_coordinator=directory_coordinator,
         )
         run_summary = run_file_phase_sqlite(
             api_client=api_client,

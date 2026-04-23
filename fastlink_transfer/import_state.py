@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -186,14 +187,14 @@ class ImportState:
         return [str(row[0]) for row in rows]
 
     def count_pending_files(self, *, retry_failed: bool = False) -> int:
-        statuses = ["pending"]
         if retry_failed:
-            statuses.extend(["failed", "not_reusable"])
-        placeholders = ", ".join("?" for _ in statuses)
-        row = self.connection.execute(
-            f"SELECT COUNT(*) FROM files WHERE status IN ({placeholders})",
-            statuses,
-        ).fetchone()
+            row = self.connection.execute(
+                "SELECT COUNT(*) FROM files WHERE status = 'pending' OR status = 'not_reusable' OR (status = 'failed' AND error <> 'duplicate normalized file path')"
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT COUNT(*) FROM files WHERE status = 'pending'"
+            ).fetchone()
         return 0 if row is None else int(row[0])
 
     def count_pending_folders(self) -> int:
@@ -254,20 +255,26 @@ class ImportState:
         common_path: str,
         total_files: int,
         total_folders: int,
+        failed_count: int = 0,
     ) -> None:
         normalized_common_path = normalize_common_path(common_path)
         self.connection.execute(
-            "UPDATE job SET source_sha256 = ?, common_path = ?, planning_complete = 1, total_files = ?, total_folders = ?, completed_count = 0, not_reusable_count = 0, failed_count = 0, last_flush_at = NULL WHERE singleton = 1",
-            (source_sha256, normalized_common_path, total_files, total_folders),
+            "UPDATE job SET source_sha256 = ?, common_path = ?, planning_complete = 1, total_files = ?, total_folders = ?, completed_count = 0, not_reusable_count = 0, failed_count = ?, last_flush_at = NULL WHERE singleton = 1",
+            (source_sha256, normalized_common_path, total_files, total_folders, failed_count),
         )
         self.connection.commit()
 
     def reset_retryable_rows(self) -> None:
         self.connection.execute(
-            "UPDATE files SET status = 'pending', error = NULL, retries = 0 WHERE status IN ('failed', 'not_reusable')"
+            "UPDATE files SET status = 'pending', error = NULL, retries = 0 WHERE status = 'not_reusable' OR (status = 'failed' AND error <> 'duplicate normalized file path')"
         )
+        remaining_failed_row = self.connection.execute(
+            "SELECT COUNT(*) FROM files WHERE status = 'failed'"
+        ).fetchone()
+        remaining_failed = 0 if remaining_failed_row is None else int(remaining_failed_row[0])
         self.connection.execute(
-            "UPDATE job SET not_reusable_count = 0, failed_count = 0 WHERE singleton = 1"
+            "UPDATE job SET not_reusable_count = 0, failed_count = ? WHERE singleton = 1",
+            (remaining_failed,),
         )
         self.connection.commit()
 
@@ -543,18 +550,32 @@ def open_or_initialize_import_state(
 
     connection: sqlite3.Connection | None = None
     try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(state_path, check_same_thread=False)
-        connection.execute("PRAGMA foreign_keys = OFF")
-
         if not state_exists:
-            connection.executescript(SCHEMA_SQL)
-            connection.execute(
-                "INSERT INTO job (singleton, schema_version, source_file, source_sha256, target_parent_id, common_path, planning_complete, total_files, total_folders, completed_count, not_reusable_count, failed_count, last_flush_at) VALUES (1, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL)",
-                (SCHEMA_VERSION, source_file, source_sha256, target_parent_id, normalized_common_path),
-            )
-            connection.commit()
+            try:
+                initialized = initialize_import_state_for_planning(
+                    state_path=state_path,
+                    source_file=source_file,
+                    target_parent_id=target_parent_id,
+                )
+                connection = initialized.connection
+                connection.execute(
+                    "UPDATE job SET source_sha256 = ?, common_path = ? WHERE singleton = 1",
+                    (source_sha256, normalized_common_path),
+                )
+                connection.commit()
+            except BaseException:
+                if connection is not None:
+                    connection.close()
+                try:
+                    if state_path.exists():
+                        os.unlink(state_path)
+                except OSError:
+                    pass
+                raise
         else:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(state_path, check_same_thread=False)
+            connection.execute("PRAGMA foreign_keys = OFF")
             _validate_import_state_schema(connection)
             _validate_import_state_rows(connection)
 
@@ -593,6 +614,39 @@ def open_or_initialize_import_state(
         if connection is not None:
             connection.close()
         raise ValueError(MALFORMED_STATE_ERROR) from exc
+
+
+def initialize_import_state_for_planning(
+    *,
+    state_path: Path,
+    source_file: str,
+    target_parent_id: str,
+) -> ImportState:
+    connection: sqlite3.Connection | None = None
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(state_path, check_same_thread=False)
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(SCHEMA_SQL)
+        connection.execute(
+            "INSERT INTO job (singleton, schema_version, source_file, source_sha256, target_parent_id, common_path, planning_complete, total_files, total_folders, completed_count, not_reusable_count, failed_count, last_flush_at) VALUES (1, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL)",
+            (SCHEMA_VERSION, source_file, "", target_parent_id, ""),
+        )
+        connection.commit()
+        return ImportState(
+            connection=connection,
+            state_path=state_path,
+            folder_map={"": target_parent_id},
+        )
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        try:
+            if state_path.exists():
+                os.unlink(state_path)
+        except OSError:
+            pass
+        raise
 
 
 def _hex_to_base62(etag_hex: str) -> str:
