@@ -289,6 +289,71 @@ def test_create_remote_directories_reuses_batch_global_directory_cache_across_st
     assert state_two.folder_map == {"": "100", "Demo": "1", "Demo/1983": "2"}
 
 
+def test_create_remote_directories_reuses_existing_remote_directories_after_local_state_loss(tmp_path):
+    first_client = ListingDirectoryClient(
+        listings={
+            "100": [],
+            "200": [],
+        },
+        mkdir_decisions=[
+            Decision(kind=DecisionKind.DIRECTORY_CREATED, file_id="200"),
+            Decision(kind=DecisionKind.DIRECTORY_CREATED, file_id="300"),
+        ],
+    )
+    resumed_client = ListingDirectoryClient(
+        listings={
+            "100": [{"FileId": 200, "Type": 1, "FileName": "Demo"}],
+            "200": [{"FileId": 300, "Type": 1, "FileName": "1983"}],
+        }
+    )
+    state = TransferState(
+        source_file="a",
+        source_sha256="abc",
+        target_parent_id="100",
+        common_path="Demo/",
+        workers=8,
+        folder_map={"": "100"},
+        completed=set(),
+        not_reusable={},
+        failed={},
+        stats={"total": 0, "completed": 0, "not_reusable": 0, "failed": 0},
+        last_flush_at=None,
+    )
+
+    create_remote_directories(
+        api_client=first_client,
+        state=state,
+        folder_keys=["Demo", "Demo/1983"],
+        state_path=tmp_path / "first.state.json",
+    )
+
+    resumed_state = TransferState(
+        source_file="a",
+        source_sha256="abc",
+        target_parent_id="100",
+        common_path="Demo/",
+        workers=8,
+        folder_map={"": "100"},
+        completed=set(),
+        not_reusable={},
+        failed={},
+        stats={"total": 0, "completed": 0, "not_reusable": 0, "failed": 0},
+        last_flush_at=None,
+    )
+
+    create_remote_directories(
+        api_client=resumed_client,
+        state=resumed_state,
+        folder_keys=["Demo", "Demo/1983"],
+        state_path=tmp_path / "resumed.state.json",
+    )
+
+    assert first_client.mkdir_calls == [("100", "Demo"), ("200", "1983")]
+    assert resumed_client.get_file_list_calls == ["100", "200"]
+    assert resumed_client.mkdir_calls == []
+    assert resumed_state.folder_map == {"": "100", "Demo": "200", "Demo/1983": "300"}
+
+
 @pytest.mark.parametrize(
     ("decision_kind", "error"),
     [
