@@ -6,7 +6,12 @@ import pytest
 
 from fastlink_transfer.api import Decision, DecisionKind
 from fastlink_transfer.app import run_cli, summarize_exit_code
-from fastlink_transfer.config import BatchImportJsonConfig, ExportJsonConfig, build_command_config
+from fastlink_transfer.config import (
+    BatchCheckJsonConfig,
+    BatchImportJsonConfig,
+    ExportJsonConfig,
+    build_command_config,
+)
 from fastlink_transfer.import_planner import inspect_export_scope, rebuild_incomplete_plan_if_needed
 from fastlink_transfer.import_state import SQLITE_HEADER, open_or_initialize_import_state
 from fastlink_transfer.importer import load_export_file
@@ -81,6 +86,48 @@ def test_build_command_config_builds_export_json_config(tmp_path):
     assert config.flush_every == 50
 
 
+def test_build_command_config_builds_batch_check_json_config(tmp_path):
+    args = SimpleNamespace(
+        command="batch_check_json",
+        input_dir=str(tmp_path / "exports"),
+        target_parent_id="12345678",
+        state_dir=str(tmp_path / ".state" / "check"),
+        output_dir=str(tmp_path / "delta"),
+        workers=8,
+        json_parallelism=2,
+        max_retries=5,
+        flush_every=100,
+        exist_only=True,
+        with_checksum=False,
+    )
+
+    config = build_command_config(args)
+
+    assert isinstance(config, BatchCheckJsonConfig)
+    assert config.command == "batch_check_json"
+    assert config.compare_mode == "exist_only"
+    assert config.output_dir == (tmp_path / "delta").resolve()
+
+
+def test_build_command_config_rejects_conflicting_batch_check_modes(tmp_path):
+    args = SimpleNamespace(
+        command="batch_check_json",
+        input_dir=str(tmp_path / "exports"),
+        target_parent_id="12345678",
+        state_dir=str(tmp_path / ".state" / "check"),
+        output_dir=str(tmp_path / "delta"),
+        workers=8,
+        json_parallelism=2,
+        max_retries=5,
+        flush_every=100,
+        exist_only=True,
+        with_checksum=True,
+    )
+
+    with pytest.raises(ValueError, match=r"--exist-only and --with-checksum are mutually exclusive"):
+        build_command_config(args)
+
+
 def test_run_cli_routes_export_json_to_export_runner(monkeypatch, tmp_path):
     config = ExportJsonConfig(
         command="export_json",
@@ -110,6 +157,28 @@ def test_run_cli_routes_export_json_to_export_runner(monkeypatch, tmp_path):
     exit_code = run_cli(["export-json"])
 
     assert exit_code == 0
+    assert calls and calls[0]["config"] == config
+
+
+def test_run_cli_routes_batch_check_json_to_batch_check_runner(monkeypatch, tmp_path):
+    config = BatchCheckJsonConfig(
+        command="batch_check_json",
+        input_dir=(tmp_path / "exports").resolve(),
+        target_parent_id="12345678",
+        state_dir=(tmp_path / ".state" / "check").resolve(),
+        output_dir=(tmp_path / "delta").resolve(),
+        workers=8,
+        json_parallelism=2,
+        max_retries=5,
+        flush_every=100,
+        compare_mode="exist_only",
+    )
+    calls = []
+
+    monkeypatch.setattr("fastlink_transfer.app.parse_args", lambda argv=None: (None, config))
+    monkeypatch.setattr("fastlink_transfer.app.run_batch_check_cli", lambda **kwargs: calls.append(kwargs) or 0)
+
+    assert run_cli(["batch-check-json"]) == 0
     assert calls and calls[0]["config"] == config
 
 
@@ -566,3 +635,12 @@ def test_readme_mentions_batch_import_json_and_sqlite_state():
     assert "json-parallelism" in readme
     assert ".state/h-suki.import-state.retry.export.json" in readme
     assert "<state-file>.retry.export.json" not in readme
+
+
+def test_readme_mentions_batch_check_json_and_delta_output_contract():
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "batch-check-json" in readme
+    assert "--with-checksum" in readme
+    assert ".delta.export.json" in readme
+    assert "delta" in readme.lower()

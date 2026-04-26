@@ -44,12 +44,26 @@ class BatchImportJsonConfig:
     command: str = "batch_import_json"
 
 
+@dataclass(frozen=True)
+class BatchCheckJsonConfig:
+    input_dir: Path
+    target_parent_id: str
+    state_dir: Path
+    output_dir: Path
+    workers: int
+    json_parallelism: int
+    max_retries: int
+    flush_every: int
+    compare_mode: str
+    command: str = "batch_check_json"
+
+
 CommandConfig = ImportJsonConfig
 
 
 def build_command_config(
     args,
-) -> ImportJsonConfig | ExportJsonConfig | BatchImportJsonConfig:
+) -> ImportJsonConfig | ExportJsonConfig | BatchImportJsonConfig | BatchCheckJsonConfig:
     if args.workers < 1:
         raise ValueError("workers must be >= 1")
     if args.max_retries < 0:
@@ -92,6 +106,29 @@ def build_command_config(
             flush_every=int(args.flush_every),
             retry_failed=bool(args.retry_failed),
             dry_run=bool(args.dry_run),
+        )
+
+    if args.command == "batch_check_json":
+        target_parent_id = str(args.target_parent_id).strip()
+        if not target_parent_id:
+            raise ValueError("target_parent_id is required")
+        if args.json_parallelism < 1:
+            raise ValueError("json_parallelism must be >= 1")
+        if args.exist_only and args.with_checksum:
+            raise ValueError("--exist-only and --with-checksum are mutually exclusive")
+
+        compare_mode = "with_checksum" if args.with_checksum else "exist_only"
+        return BatchCheckJsonConfig(
+            command="batch_check_json",
+            input_dir=Path(args.input_dir).resolve(),
+            target_parent_id=target_parent_id,
+            state_dir=Path(args.state_dir).resolve(),
+            output_dir=Path(args.output_dir).resolve(),
+            workers=int(args.workers),
+            json_parallelism=int(args.json_parallelism),
+            max_retries=int(args.max_retries),
+            flush_every=int(args.flush_every),
+            compare_mode=compare_mode,
         )
 
     if args.command == "export_json":

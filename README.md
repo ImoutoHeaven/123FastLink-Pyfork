@@ -21,6 +21,7 @@ export PAN_HOST='https://www.123pan.com'
 - `export-json`：在线递归扫描一个 123Pan 目录，生成可直接被 `import-json` 使用的 JSON 导出文件。
 - `import-json`：读取 JSON 导出文件，使用 SQLite 状态数据库规划、续跑并执行导入。
 - `batch-import-json`：递归发现目录下的导出 JSON，为每个 JSON 维护独立 SQLite 状态数据库，并批量调度导入。
+- `batch-check-json`：递归发现导出 JSON，对比远端目录树，按需写出 `.delta.export.json` 差量文件。
 
 ## export-json
 
@@ -117,6 +118,28 @@ python -m fastlink_transfer batch-import-json \
 - 每个 JSON 的 retry export 都会写到 `--state-dir` 下，并保持源 JSON 的相对目录结构。
 - batch 运行会先完成所有 child job 的 planning 和目标路径碰撞检查，发现冲突时会在任何远端变更前失败。
 
+## batch-check-json
+
+```bash
+python -m fastlink_transfer batch-check-json \
+  --input-dir exports \
+  --target-parent-id 12345678 \
+  --state-dir .state/check \
+  --output-dir delta-exports \
+  --workers 8 \
+  --json-parallelism 2 \
+  --with-checksum
+```
+
+- 递归发现 `--input-dir` 下的 `*.json`，并保持源 JSON 的相对目录结构。
+- 每个 JSON 都会在 `--state-dir` 下获得独立的 SQLite check state，文件后缀为 `.check-state.sqlite3`。
+- 每个 JSON 的差量输出会写到 `--output-dir` 下，文件后缀为 `.delta.export.json`。
+- 默认使用 `--exist-only`，只比较远端是否存在同路径文件；`--with-checksum` 会继续比较 checksum 和 size。
+- 如果某个 JSON 的 file delta 为空，不会保留 `.delta.export.json`；如果存在旧的 stale delta 文件，会在 finalize 时删除。
+- 目录差异会体现在 summary 的 `missing_dirs` 统计里；只有缺失或 checksum/size 不一致的文件才会进入 delta。
+- 同一个 job 在 scope 不变时可复用已持久化的远端索引；从 `--exist-only` 切换到 `--with-checksum` 时会复用 remote scan 结果，只重跑 delta finalize。
+- 如果 `commonPath` 对应的整棵远端子树不存在，该 job 仍会成功完成，并把预期文件全部写入 delta。
+
 ## 退出行为
 
 - `export-json` 在成功生成最终 JSON 时返回 `0`。
@@ -127,3 +150,5 @@ python -m fastlink_transfer batch-import-json \
 - `import-json` 在启动校验失败、凭证失效、状态数据库损坏、状态数据库与当前运行范围不匹配，或非 `--dry-run` 运行最终仍存在 `failed` 项时返回 `1`。
 - `batch-import-json` 在所有子任务都完成，或最终只剩 `not_reusable` 项时返回 `0`。
 - `batch-import-json` 在 discovery 为空、preflight collision 检查失败、任一子任务失败，或出现 batch-global credential fatal 时返回 `1`。
+- `batch-check-json` 在所有子任务都成功完成检查时返回 `0`；发现 delta 或目录差异本身不会导致失败。
+- `batch-check-json` 在 discovery 为空、启动校验失败、state/output 根目录创建失败、任一子任务失败，或出现 batch-global credential fatal 时返回 `1`。

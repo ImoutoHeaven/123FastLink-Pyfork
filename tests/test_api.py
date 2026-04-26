@@ -203,6 +203,16 @@ class FakeSession:
         return self.response
 
 
+class SequencedGetSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, params=None):
+        self.calls.append((url, params))
+        return self.responses.pop(0)
+
+
 def test_mkdir_posts_frozen_payload():
     session = FakeSession(FakeResponse(200, {"code": 0, "data": {"Info": {"FileId": 7}}}))
     client = PanApiClient(host="https://www.123pan.com", session=session)
@@ -226,6 +236,38 @@ def test_mkdir_posts_frozen_payload():
             },
         )
     ]
+
+
+def test_iter_file_list_pages_yields_each_page_without_accumulating():
+    session = SequencedGetSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "code": 0,
+                    "data": {
+                        "InfoList": [{"FileId": 10, "Type": 1, "FileName": "Action"}],
+                        "Total": 101,
+                    },
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "code": 0,
+                    "data": {
+                        "InfoList": [{"FileId": 11, "Type": 0, "FileName": "b.txt", "Etag": "0" * 32, "Size": 5}],
+                        "Total": 101,
+                    },
+                },
+            ),
+        ]
+    )
+    client = PanApiClient(host="https://www.123pan.com", session=session)
+
+    page_items = [page.payload["items"] for page in client.iter_file_list_pages(parent_file_id="123")]
+
+    assert [[item["FileId"] for item in items] for items in page_items] == [[10], [11]]
 
 
 def test_rapid_upload_posts_frozen_payload():

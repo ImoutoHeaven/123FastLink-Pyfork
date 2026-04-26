@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastlink_transfer.api import PanApiClient
 from fastlink_transfer.auth import build_session, load_credentials
+from fastlink_transfer.batch_check import run_batch_check_cli
 from fastlink_transfer.batch_import import run_batch_import_cli
 from fastlink_transfer.cli import parse_args
 from fastlink_transfer.exporter import run_export_json
@@ -58,6 +59,9 @@ def run_cli(argv=None) -> int:
 
     if config.command == "batch_import_json":
         return run_batch_import_cli(config=config)
+
+    if config.command == "batch_check_json":
+        return run_batch_check_cli(config=config)
 
     creds = load_credentials()
     session = build_session(creds)

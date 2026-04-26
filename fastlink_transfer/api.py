@@ -248,18 +248,24 @@ class PanApiClient:
 
         return _classify_list_payload(response)
 
-    def get_file_list(self, *, parent_file_id: str) -> Decision:
+    def iter_file_list_pages(self, *, parent_file_id: str):
         first_page = self.get_file_list_page(parent_file_id=parent_file_id, page=1)
+        yield first_page
         if first_page.kind != DecisionKind.COMPLETED:
-            return first_page
+            return
 
-        items = list(first_page.payload["items"])
         total = first_page.payload["total"]
         page_count = (total + 99) // 100
         for page in range(2, page_count + 1):
-            page_decision = self.get_file_list_page(parent_file_id=parent_file_id, page=page)
+            yield self.get_file_list_page(parent_file_id=parent_file_id, page=page)
+
+    def get_file_list(self, *, parent_file_id: str) -> Decision:
+        items = []
+        total = 0
+        for page_decision in self.iter_file_list_pages(parent_file_id=parent_file_id):
             if page_decision.kind != DecisionKind.COMPLETED:
                 return page_decision
             items.extend(page_decision.payload["items"])
+            total = page_decision.payload["total"]
 
         return Decision(kind=DecisionKind.COMPLETED, payload={"items": items, "total": total})
