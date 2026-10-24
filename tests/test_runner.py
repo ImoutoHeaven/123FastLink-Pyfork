@@ -4,10 +4,11 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from fastlink_transfer.api import Decision, DecisionKind, PanApiClient
+from fastlink_transfer.api import Decision, DecisionKind, PanApiClient, classify_json_response
 from fastlink_transfer.import_state import open_or_initialize_import_state
 from fastlink_transfer.importer import SourceRecord, load_export_file, select_pending_records
 from fastlink_transfer.runner import (
@@ -461,6 +462,62 @@ def test_run_file_phase_updates_sqlite_state_in_batched_writer_commits(tmp_path)
     }
 
 
+def test_run_file_phase_sqlite_serializes_parent_lookup_and_progress_write(tmp_path, monkeypatch):
+    state = open_or_initialize_import_state(
+        state_path=tmp_path / "import.state.sqlite3",
+        source_file="/tmp/export.json",
+        source_sha256="abc",
+        target_parent_id="100",
+        common_path="",
+    )
+    state.connection.executemany(
+        "INSERT INTO files (record_key, path, file_name, relative_parent_dir, etag_hex, size, status, error, retries) VALUES (?, ?, ?, '', ?, 1, 'pending', NULL, 0)",
+        [(f"k{i}", f"{i}.txt", f"{i}.txt", "0" * 32) for i in range(6)],
+    )
+    state.connection.execute("UPDATE job SET planning_complete = 1, total_files = 6")
+    state.connection.commit()
+    state.workers = 1
+    read_started = threading.Event()
+    read_active = threading.Event()
+    write_attempted = threading.Event()
+    original_resolve = state.resolve_parent_file_id
+    original_flush = state.flush_terminal_outcomes
+    lookups = 0
+
+    def resolve_parent(*, relative_parent_dir):
+        nonlocal lookups
+        lookups += 1
+        if lookups == 3:
+            read_active.set()
+            read_started.set()
+            try:
+                write_attempted.wait(timeout=0.2)
+                return original_resolve(relative_parent_dir=relative_parent_dir)
+            finally:
+                read_active.clear()
+        return original_resolve(relative_parent_dir=relative_parent_dir)
+
+    def flush_outcomes(outcomes):
+        write_attempted.set()
+        assert not read_active.is_set(), "shared SQLite read overlapped progress write"
+        return original_flush(outcomes)
+
+    class Client:
+        def rapid_upload(self, **kwargs):
+            assert read_started.wait(timeout=2), "producer did not reach queued parent lookup"
+            return Decision(kind=DecisionKind.COMPLETED, file_id="1")
+
+    monkeypatch.setattr(state, "resolve_parent_file_id", resolve_parent)
+    monkeypatch.setattr(state, "flush_terminal_outcomes", flush_outcomes)
+    try:
+        result = run_file_phase_sqlite(api_client=Client(), state=state, max_retries=0, flush_every=1)
+        assert result == {"processed": 6, "credential_fatal": False}
+        assert state.fetch_status_counts() == {"pending": 0, "completed": 6, "not_reusable": 0, "failed": 0}
+        assert state.stats["completed"] == 6
+    finally:
+        state.close()
+
+
 def test_run_file_phase_sqlite_rolls_back_partial_terminal_updates_when_job_counter_flush_fails(
     tmp_path,
 ):
@@ -611,11 +668,19 @@ def test_process_record_retries_then_records_failed(monkeypatch):
     assert state.failed["k"] == {"key": "k", "path": "a.txt", "error": "bad payload", "retries": 1}
 
 
-def test_process_record_uses_global_pause_for_429(monkeypatch):
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [
+        (429, {"code": 429, "message": "slow down"}),
+        (200, {"code": 429, "message": "slow down"}),
+        (200, {"code": 1, "message": "请勿频繁操作，请稍后再试"}),
+    ],
+)
+def test_process_record_uses_global_pause_for_429(monkeypatch, status, payload):
     monkeypatch.setattr("fastlink_transfer.runner.compute_backoff", lambda _attempt: 1.25)
     client = SequenceClient(
         [
-            Decision(kind=DecisionKind.RETRYABLE, error="HTTP 429"),
+            classify_json_response(SimpleNamespace(status_code=status, json=lambda: payload), operation="file"),
             Decision(kind=DecisionKind.COMPLETED, file_id="1"),
         ]
     )

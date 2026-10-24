@@ -52,7 +52,7 @@ def validate_https_origin(value: str) -> str:
 
 
 def load_credentials() -> CredentialConfig:
-    host = validate_https_origin(os.environ.get("PAN_HOST", "https://www.123pan.com"))
+    host = validate_https_origin(os.environ.get("PAN_HOST", "https://yun.123pan.cn"))
     auth_token = os.environ.get("PAN_AUTH_TOKEN", "")
     login_uuid = os.environ.get("PAN_LOGIN_UUID", "")
     cookie = os.environ.get("PAN_COOKIE", "")

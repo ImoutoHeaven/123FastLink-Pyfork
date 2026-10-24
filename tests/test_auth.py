@@ -11,7 +11,7 @@ def test_load_credentials_reads_required_environment(monkeypatch):
     creds = load_credentials()
 
     assert creds == CredentialConfig(
-        host="https://www.123pan.com",
+        host="https://yun.123pan.cn",
         auth_token="token",
         login_uuid="uuid",
         cookie="cookie=value",
@@ -81,7 +81,7 @@ def test_build_session_applies_frozen_headers(monkeypatch):
     assert session.headers["LoginUuid"] == "uuid"
     assert session.headers["platform"] == "web"
     assert session.headers["App-Version"] == "3"
-    assert session.headers["Origin"] == "https://www.123pan.com"
-    assert session.headers["Referer"] == "https://www.123pan.com/"
+    assert session.headers["Origin"] == "https://yun.123pan.cn"
+    assert session.headers["Referer"] == "https://yun.123pan.cn/"
     assert session.headers["Content-Type"] == "application/json;charset=UTF-8"
     assert session.headers["Cookie"] == "cookie=value"

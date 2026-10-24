@@ -544,6 +544,79 @@ def test_run_remote_scan_persists_progress_without_remote_table_recounts(tmp_pat
     assert state.summary_counters["remote_dirs"] == 6
 
 
+def test_run_remote_scan_keeps_sqlite_access_on_coordinator_thread(tmp_path, monkeypatch):
+    state = planned_state_with_common_path(tmp_path, common_path="Demo/")
+    coordinator = threading.current_thread()
+    connection = state.connection
+
+    class CoordinatorConnection:
+        def execute(self, query, parameters=()):
+            assert threading.current_thread() is coordinator, "worker accessed shared SQLite connection"
+            return connection.execute(query, parameters)
+
+        def __enter__(self):
+            connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return connection.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+    monkeypatch.setattr(state, "connection", CoordinatorConnection())
+
+    run_remote_scan(api_client=FakeCheckClient(), state=state, state_path=state.state_path, max_retries=0)
+
+    assert state.phase["remote_scan_complete"] is True
+    assert state.summary_counters["remote_files"] == 2
+
+
+@pytest.mark.parametrize("failure_phase", ["dispatch", "start", "after_start"])
+def test_run_remote_scan_stops_workers_when_startup_fails(tmp_path, monkeypatch, failure_phase):
+    state = planned_state_with_common_path(tmp_path, common_path="Demo/")
+    state.workers = 2
+    state.seed_resolved_remote_dirs(completed_dirs=[], root_dir=("Demo", "200"))
+    original_thread = threading.Thread
+    workers = []
+    queues = []
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("startup failure")
+
+    def make_thread(*args, **kwargs):
+        thread = original_thread(*args, **kwargs)
+        workers.append(thread)
+        queues.append(kwargs["args"][0])
+        if len(workers) == 2 and failure_phase in {"start", "after_start"}:
+            original_start = thread.start
+
+            def failing_start():
+                if failure_phase == "after_start":
+                    original_start()
+                fail()
+
+            thread.start = failing_start
+        return thread
+
+    monkeypatch.setattr("fastlink_transfer.batch_check.threading.Thread", make_thread)
+    if failure_phase == "dispatch":
+        monkeypatch.setattr(state, "fetch_next_pending_remote_dir", fail)
+
+    try:
+        with pytest.raises(RuntimeError, match="startup failure"):
+            run_remote_scan(api_client=FakeCheckClient(), state=state, state_path=state.state_path, max_retries=0)
+        assert not any(thread.is_alive() for thread in workers), "startup failure leaked workers"
+    finally:
+        for thread, work_queue in zip(workers, queues):
+            if thread.is_alive():
+                work_queue.put(None)
+        for thread in workers:
+            if thread.ident is not None:
+                thread.join(timeout=1)
+        state.close()
+
+
 def test_run_remote_scan_dispatches_pending_dirs_without_fetchall(tmp_path, monkeypatch):
     state = planned_state_with_common_path(tmp_path, common_path="Demo/")
     state.workers = 1

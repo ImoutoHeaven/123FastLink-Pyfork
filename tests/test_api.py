@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 from curl_cffi.requests import exceptions as request_exceptions
 
 from fastlink_transfer.api import (
@@ -57,6 +58,23 @@ def test_classify_response_marks_429_as_retryable():
     decision = classify_json_response(response, operation="file")
 
     assert decision.kind is DecisionKind.RETRYABLE
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"code": 429, "message": "slow down"},
+        {"code": 1, "message": "请勿频繁操作，请稍后再试"},
+    ],
+)
+def test_classify_response_retries_business_rate_limits(payload):
+    response = SimpleNamespace(status_code=200, json=lambda: payload)
+
+    decision = classify_json_response(response, operation="list")
+
+    assert decision.kind is DecisionKind.RETRYABLE
+    assert payload["message"] in decision.error
+    assert "429" in decision.error
 
 
 def test_classify_response_marks_invalid_json_as_failed():

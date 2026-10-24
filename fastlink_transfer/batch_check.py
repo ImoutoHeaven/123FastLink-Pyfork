@@ -659,6 +659,7 @@ def _run_remote_scan_loop(*, api_client, state, state_path: Path, max_retries: i
     queued_paths: set[str] = set()
     active_paths: set[str] = set()
     worker_limit = max(int(state.workers), 1)
+    common_path = state.job_scope["common_path"]
 
     def dispatch_available_work(work_queue: queue.Queue) -> None:
         while not stop_event.is_set() and len(active_paths) + len(queued_paths) < worker_limit:
@@ -685,7 +686,7 @@ def _run_remote_scan_loop(*, api_client, state, state_path: Path, max_retries: i
                 result_queue.put(("claimed", target_relative_path, None))
                 for child_dirs, file_rows in _scan_remote_directory(
                     api_client=api_client,
-                    common_path=state.job_scope["common_path"],
+                    common_path=common_path,
                     target_relative_path=target_relative_path,
                     remote_dir_id=remote_dir_id,
                     max_retries=max_retries,
@@ -701,11 +702,10 @@ def _run_remote_scan_loop(*, api_client, state, state_path: Path, max_retries: i
 
     work_queue: queue.Queue = queue.Queue()
     threads = [threading.Thread(target=worker, args=(work_queue,), daemon=False) for _ in range(worker_limit)]
-    for thread in threads:
-        thread.start()
-
-    dispatch_available_work(work_queue)
     try:
+        for thread in threads:
+            thread.start()
+        dispatch_available_work(work_queue)
         while state.has_pending_remote_dirs() or active_paths or queued_paths:
             event, *payload = result_queue.get()
             if event == "claimed":
@@ -716,11 +716,6 @@ def _run_remote_scan_loop(*, api_client, state, state_path: Path, max_retries: i
                 continue
             if event == "error":
                 exc = payload[1]
-                stop_event.set()
-                for _ in threads:
-                    work_queue.put(None)
-                for thread in threads:
-                    thread.join()
                 raise exc
 
             if event == "page":
@@ -751,7 +746,8 @@ def _run_remote_scan_loop(*, api_client, state, state_path: Path, max_retries: i
         for _ in threads:
             work_queue.put(None)
         for thread in threads:
-            thread.join()
+            if thread.ident is not None:
+                thread.join()
 
     if flush_counter["directories"]:
         state.flush_remote_progress(state_path=state_path)

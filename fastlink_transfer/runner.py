@@ -586,9 +586,10 @@ def run_file_phase_sqlite(*, api_client, state, max_retries: int, flush_every: i
                     record.path = str(path)
                     record.file_name = str(file_name)
                     record.relative_parent_dir = str(relative_parent_dir)
-                    parent_file_id = state.resolve_parent_file_id(
-                        relative_parent_dir=record.relative_parent_dir
-                    )
+                    with terminal_lock:
+                        parent_file_id = state.resolve_parent_file_id(
+                            relative_parent_dir=record.relative_parent_dir
+                        )
                     while True:
                         if stop_controller.shutdown_started():
                             return

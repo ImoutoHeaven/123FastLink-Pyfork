@@ -22,6 +22,9 @@ def _ensure(condition: bool, message: str) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    # Windows CRT cannot open directory descriptors; file data is fsynced before replace.
+    if os.name == "nt":
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY

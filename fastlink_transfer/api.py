@@ -7,6 +7,7 @@ from curl_cffi.requests import exceptions as request_exceptions
 
 
 CREDENTIAL_MESSAGES = {"login expired", "Please Login", "not login"}
+RETRYABLE_MESSAGES = {"请勿频繁操作，请稍后再试"}
 RETRYABLE_TRANSPORT_NAMES = {
     "DNSError",
     "SSLError",
@@ -70,6 +71,12 @@ def classify_json_response(response, *, operation: str) -> Decision:
     if code != 0:
         if isinstance(message, str) and message in CREDENTIAL_MESSAGES:
             return Decision(kind=DecisionKind.CREDENTIAL_FATAL, error=message, payload=payload)
+        if code == 429 or (isinstance(message, str) and message in RETRYABLE_MESSAGES):
+            return Decision(
+                kind=DecisionKind.RETRYABLE,
+                error=f"rate limited (429): {message}" if isinstance(message, str) and message else "rate limited (429)",
+                payload=payload,
+            )
         return Decision(
             kind=DecisionKind.FAILED,
             error=message if isinstance(message, str) and message else f"api code {code}",

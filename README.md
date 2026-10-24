@@ -11,10 +11,10 @@ export PAN_COOKIE='...'
 可选环境变量：
 
 ```bash
-export PAN_HOST='https://www.123pan.com'
+export PAN_HOST='https://yun.123pan.cn'
 ```
 
-不设置 `PAN_HOST` 时，默认使用 `https://www.123pan.com`。
+不设置 `PAN_HOST` 时，默认使用 `https://yun.123pan.cn`。
 
 ## 命令概览
 

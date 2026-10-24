@@ -1523,6 +1523,21 @@ def test_run_export_json_starts_fresh_when_legacy_marker_only_leftovers_remain_w
     assert not _success_marker_path(config.state_file).exists()
 
 
+@pytest.mark.parametrize("module_name", ["exporter", "export_state"])
+def test_directory_fsync_does_not_open_directory_with_windows_crt(module_name, monkeypatch, tmp_path):
+    import importlib
+
+    module = importlib.import_module(f"fastlink_transfer.{module_name}")
+
+    def reject_directory_open(*args):
+        pytest.fail("Windows CRT cannot open directory descriptors")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt", O_RDONLY=0, open=reject_directory_open))
+
+    module._fsync_directory(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync contract")
 def test_finalize_export_json_fsyncs_output_parent_directory(monkeypatch, tmp_path):
     records_file = tmp_path / "export.state.records.jsonl"
     records_file.write_text(
@@ -1577,6 +1592,7 @@ def test_finalize_export_json_fsyncs_output_parent_directory(monkeypatch, tmp_pa
     assert replace_index < open_index < dir_fsync_index < close_index
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync contract")
 def test_mark_final_output_committed_fsyncs_marker_parent_directory(monkeypatch, tmp_path):
     from fastlink_transfer import exporter as exporter_module
 

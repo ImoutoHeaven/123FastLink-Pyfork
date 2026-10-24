@@ -135,6 +135,7 @@ def test_open_or_initialize_import_state_cleans_up_new_state_when_metadata_updat
 
     class InterruptingImportState:
         def __init__(self, wrapped):
+            self._wrapped = wrapped
             self.connection = self
             self.state_path = wrapped.state_path
             self.folder_map = wrapped.folder_map
@@ -148,7 +149,7 @@ def test_open_or_initialize_import_state_cleans_up_new_state_when_metadata_updat
             raise AssertionError("commit should not run after interrupt")
 
         def close(self):
-            return None
+            return self._wrapped.close()
 
     def fake_initializer(**kwargs):
         wrapped = original_initializer(**kwargs)

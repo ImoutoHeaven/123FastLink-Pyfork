@@ -263,6 +263,7 @@ def test_recover_inflight_dirs_moves_them_to_pending_front(tmp_path):
     assert state.inflight_dirs == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync contract")
 def test_export_state_flush_fsyncs_parent_directory_after_atomic_replace(monkeypatch, tmp_path):
     state = ExportState(
         source_host="https://www.123pan.com",
